@@ -24,11 +24,12 @@ import (
 	"time"
 
 	"github.com/pingcap/log"
-	"github.com/pingcap/tidb/parser/terror"
-	"github.com/pingcap/tidb/session"
-	"github.com/pingcap/tidb/store"
-	"github.com/pingcap/tidb/store/driver"
-	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/pkg/parser/terror"
+	"github.com/pingcap/tidb/pkg/session"
+	sessiontypes "github.com/pingcap/tidb/pkg/session/types"
+	"github.com/pingcap/tidb/pkg/store"
+	"github.com/pingcap/tidb/pkg/store/driver"
+	"github.com/pingcap/tidb/pkg/util/logutil"
 	"github.com/tikv/client-go/v2/tikv"
 	"go.uber.org/zap"
 )
@@ -55,7 +56,7 @@ var (
 func main() {
 	flag.Parse()
 	flag.PrintDefaults()
-	err := logutil.InitLogger(logutil.NewLogConfig(*logLevel, logutil.DefaultLogFormat, "", logutil.EmptyFileLogConfig, false))
+	err := logutil.InitLogger(logutil.NewLogConfig(*logLevel, logutil.DefaultLogFormat, "", "", logutil.EmptyFileLogConfig, false))
 	terror.MustNil(err)
 	err = store.Register("tikv", driver.TiKVDriver{})
 	terror.MustNil(err)
@@ -88,7 +89,7 @@ func main() {
 
 type benchDB struct {
 	store   tikv.Storage
-	session session.Session
+	session sessiontypes.Session
 }
 
 func newBenchDB() *benchDB {
@@ -108,7 +109,7 @@ func newBenchDB() *benchDB {
 	}
 }
 
-func (ut *benchDB) mustExec(sql string, args ...interface{}) {
+func (ut *benchDB) mustExec(sql string, args ...any) {
 	// executeInternal only return one resultSet for this.
 	rs, err := ut.session.ExecuteInternal(context.Background(), sql, args...)
 	defer func() {
@@ -200,8 +201,8 @@ func (ut *benchDB) truncateTable() {
 func (ut *benchDB) runCountTimes(name string, count int, f func()) {
 	var (
 		sum, first, last time.Duration
-		min              = time.Minute
-		max              = time.Nanosecond
+		minv             = time.Minute
+		maxv             = time.Nanosecond
 	)
 	cLogf("%s started", name)
 	for i := 0; i < count; i++ {
@@ -212,16 +213,16 @@ func (ut *benchDB) runCountTimes(name string, count int, f func()) {
 			first = dur
 		}
 		last = dur
-		if dur < min {
-			min = dur
+		if dur < minv {
+			minv = dur
 		}
-		if dur > max {
-			max = dur
+		if dur > maxv {
+			maxv = dur
 		}
 		sum += dur
 	}
 	cLogf("%s done, avg %s, count %d, sum %s, first %s, last %s, max %s, min %s\n\n",
-		name, sum/time.Duration(count), count, sum, first, last, max, min)
+		name, sum/time.Duration(count), count, sum, first, last, maxv, minv)
 }
 
 // #nosec G404
@@ -293,12 +294,12 @@ func (ut *benchDB) query(spec string) {
 	})
 }
 
-func cLogf(format string, args ...interface{}) {
+func cLogf(format string, args ...any) {
 	str := fmt.Sprintf(format, args...)
 	fmt.Println("\033[0;32m" + str + "\033[0m\n")
 }
 
-func cLog(args ...interface{}) {
+func cLog(args ...any) {
 	str := fmt.Sprint(args...)
 	fmt.Println("\033[0;32m" + str + "\033[0m\n")
 }
