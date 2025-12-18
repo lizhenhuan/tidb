@@ -17,15 +17,71 @@ package refresher_test
 import (
 	"context"
 	"testing"
+	"time"
 
-	pmodel "github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/statistics"
 	"github.com/pingcap/tidb/pkg/statistics/handle/autoanalyze/refresher"
+	"github.com/pingcap/tidb/pkg/statistics/handle/ddl/testutil"
 	"github.com/pingcap/tidb/pkg/statistics/handle/util"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/stretchr/testify/require"
 )
+
+func TestTurnOffAndOnAutoAnalyze(t *testing.T) {
+	statistics.AutoAnalyzeMinCnt = 0
+	defer func() {
+		statistics.AutoAnalyzeMinCnt = 1000
+	}()
+
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+
+	handle := dom.StatsHandle()
+	tk.MustExec("use test")
+	tk.MustExec("create table t (a int, b int, index idx(a))")
+	tk.MustExec("insert into t values (1, 1), (2, 2), (3, 3)")
+	require.NoError(t, handle.DumpStatsDeltaToKV(true))
+	require.NoError(t, handle.Update(context.Background(), dom.InfoSchema()))
+	tk.MustExec("analyze table t")
+
+	tk.MustExec("insert into t values (5, 4), (5, 5), (6, 6)")
+	require.NoError(t, handle.DumpStatsDeltaToKV(true))
+	require.NoError(t, handle.Update(context.Background(), dom.InfoSchema()))
+	sysProcTracker := dom.SysProcTracker()
+	r := refresher.NewRefresher(context.Background(), handle, sysProcTracker, dom.DDLNotifier())
+	defer r.Close()
+	require.NoError(t, util.CallWithSCtx(handle.SPool(), func(sctx sessionctx.Context) error {
+		require.True(t, handle.HandleAutoAnalyze())
+		return nil
+	}))
+	r.WaitAutoAnalyzeFinishedForTest()
+
+	tk.MustExec("set @@global.tidb_enable_auto_analyze = 0;")
+
+	// Add a new index to generate DDL event.
+	tk.MustExec("alter table t add index idx_b(b);")
+	// Make sure the mysql.tidb_ddl_notifier is not empty.
+	rows := tk.MustQuery("select * from mysql.tidb_ddl_notifier").Rows()
+	require.Greater(t, len(rows), 0)
+	require.Eventually(t, func() bool {
+		return !r.IsQueueInitializedForTest()
+	}, time.Second*5, time.Millisecond*100)
+
+	// Make sure the mysql.tidb_ddl_notifier table is empty.
+	require.Eventually(t, func() bool {
+		rows := tk.MustQuery("select * from mysql.tidb_ddl_notifier").Rows()
+		return len(rows) == 0
+	}, time.Second*5, time.Millisecond*100)
+
+	// Enable auto analyze again to make sure the queue is re-initialized and handles the DDL event correctly.
+	tk.MustExec("set @@global.tidb_enable_auto_analyze = 1;")
+	require.NoError(t, util.CallWithSCtx(handle.SPool(), func(sctx sessionctx.Context) error {
+		require.True(t, handle.HandleAutoAnalyze())
+		return nil
+	}))
+}
 
 func TestChangePruneMode(t *testing.T) {
 	statistics.AutoAnalyzeMinCnt = 0
@@ -42,7 +98,7 @@ func TestChangePruneMode(t *testing.T) {
 	require.NoError(t, handle.DumpStatsDeltaToKV(true))
 	require.NoError(t, handle.Update(context.Background(), dom.InfoSchema()))
 	tk.MustExec("analyze table t1")
-	r := refresher.NewRefresher(handle, dom.SysProcTracker(), dom.DDLNotifier())
+	r := refresher.NewRefresher(context.Background(), handle, dom.SysProcTracker(), dom.DDLNotifier())
 	defer r.Close()
 
 	// Insert more data to each partition.
@@ -118,7 +174,7 @@ func TestSkipAnalyzeTableWhenAutoAnalyzeRatioIsZero(t *testing.T) {
 	require.NoError(t, handle.DumpStatsDeltaToKV(true))
 	require.NoError(t, handle.Update(context.Background(), dom.InfoSchema()))
 	sysProcTracker := dom.SysProcTracker()
-	r := refresher.NewRefresher(handle, sysProcTracker, dom.DDLNotifier())
+	r := refresher.NewRefresher(context.Background(), handle, sysProcTracker, dom.DDLNotifier())
 	defer r.Close()
 	// No jobs are added.
 	require.NoError(t, util.CallWithSCtx(handle.SPool(), func(sctx sessionctx.Context) error {
@@ -151,7 +207,7 @@ func TestIgnoreNilOrPseudoStatsOfPartitionedTable(t *testing.T) {
 	tk.MustExec("insert into t2 values (1, 1), (2, 2), (3, 3)")
 	handle := dom.StatsHandle()
 	sysProcTracker := dom.SysProcTracker()
-	r := refresher.NewRefresher(handle, sysProcTracker, dom.DDLNotifier())
+	r := refresher.NewRefresher(context.Background(), handle, sysProcTracker, dom.DDLNotifier())
 	defer r.Close()
 	require.NoError(t, util.CallWithSCtx(handle.SPool(), func(sctx sessionctx.Context) error {
 		require.False(t, r.AnalyzeHighestPriorityTables(sctx))
@@ -175,7 +231,7 @@ func TestIgnoreNilOrPseudoStatsOfNonPartitionedTable(t *testing.T) {
 	tk.MustExec("insert into t2 values (1, 1), (2, 2), (3, 3)")
 	handle := dom.StatsHandle()
 	sysProcTracker := dom.SysProcTracker()
-	r := refresher.NewRefresher(handle, sysProcTracker, dom.DDLNotifier())
+	r := refresher.NewRefresher(context.Background(), handle, sysProcTracker, dom.DDLNotifier())
 	defer r.Close()
 	require.NoError(t, util.CallWithSCtx(handle.SPool(), func(sctx sessionctx.Context) error {
 		require.False(t, r.AnalyzeHighestPriorityTables(sctx))
@@ -206,15 +262,15 @@ func TestIgnoreTinyTable(t *testing.T) {
 	require.NoError(t, handle.DumpStatsDeltaToKV(true))
 	require.NoError(t, handle.Update(context.Background(), dom.InfoSchema()))
 	// Make sure table stats are not pseudo.
-	tbl1, err := dom.InfoSchema().TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("t1"))
+	tbl1, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t1"))
 	require.NoError(t, err)
 	pid1 := tbl1.Meta().GetPartitionInfo().Definitions[1].ID
-	tblStats1 := handle.GetPartitionStats(tbl1.Meta(), pid1)
+	tblStats1 := handle.GetPhysicalTableStats(pid1, tbl1.Meta())
 	require.False(t, tblStats1.Pseudo)
-	tbl2, err := dom.InfoSchema().TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("t2"))
+	tbl2, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t2"))
 	require.NoError(t, err)
 	pid2 := tbl2.Meta().GetPartitionInfo().Definitions[1].ID
-	tblStats2 := handle.GetPartitionStats(tbl2.Meta(), pid2)
+	tblStats2 := handle.GetPhysicalTableStats(pid2, tbl2.Meta())
 	require.False(t, tblStats2.Pseudo)
 
 	// Insert more data into t1 and t2, but more data is inserted into t1.
@@ -223,7 +279,7 @@ func TestIgnoreTinyTable(t *testing.T) {
 	require.NoError(t, handle.DumpStatsDeltaToKV(true))
 	require.NoError(t, handle.Update(context.Background(), dom.InfoSchema()))
 	sysProcTracker := dom.SysProcTracker()
-	r := refresher.NewRefresher(handle, sysProcTracker, dom.DDLNotifier())
+	r := refresher.NewRefresher(context.Background(), handle, sysProcTracker, dom.DDLNotifier())
 	defer r.Close()
 	require.NoError(t, util.CallWithSCtx(handle.SPool(), func(sctx sessionctx.Context) error {
 		require.True(t, r.AnalyzeHighestPriorityTables(sctx))
@@ -261,7 +317,7 @@ func TestAnalyzeHighestPriorityTables(t *testing.T) {
 	require.NoError(t, handle.DumpStatsDeltaToKV(true))
 	require.NoError(t, handle.Update(context.Background(), dom.InfoSchema()))
 	sysProcTracker := dom.SysProcTracker()
-	r := refresher.NewRefresher(handle, sysProcTracker, dom.DDLNotifier())
+	r := refresher.NewRefresher(context.Background(), handle, sysProcTracker, dom.DDLNotifier())
 	defer r.Close()
 	// Analyze t1 first.
 	require.NoError(t, util.CallWithSCtx(handle.SPool(), func(sctx sessionctx.Context) error {
@@ -272,17 +328,17 @@ func TestAnalyzeHighestPriorityTables(t *testing.T) {
 	require.NoError(t, handle.DumpStatsDeltaToKV(true))
 	require.NoError(t, handle.Update(context.Background(), dom.InfoSchema()))
 	// The table is analyzed.
-	tbl1, err := dom.InfoSchema().TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("t1"))
+	tbl1, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t1"))
 	require.NoError(t, err)
 	pid1 := tbl1.Meta().GetPartitionInfo().Definitions[1].ID
-	tblStats1 := handle.GetPartitionStats(tbl1.Meta(), pid1)
+	tblStats1 := handle.GetPhysicalTableStats(pid1, tbl1.Meta())
 	require.Equal(t, int64(0), tblStats1.ModifyCount)
 	require.Equal(t, int64(12), tblStats1.RealtimeCount)
 	// t2 is not analyzed.
-	tbl2, err := dom.InfoSchema().TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("t2"))
+	tbl2, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t2"))
 	require.NoError(t, err)
 	pid2 := tbl2.Meta().GetPartitionInfo().Definitions[1].ID
-	tblStats2 := handle.GetPartitionStats(tbl2.Meta(), pid2)
+	tblStats2 := handle.GetPhysicalTableStats(pid2, tbl2.Meta())
 	require.Equal(t, int64(6), tblStats2.ModifyCount)
 	// Do one more round.
 	require.NoError(t, util.CallWithSCtx(handle.SPool(), func(sctx sessionctx.Context) error {
@@ -292,7 +348,7 @@ func TestAnalyzeHighestPriorityTables(t *testing.T) {
 	r.WaitAutoAnalyzeFinishedForTest()
 	// t2 is analyzed.
 	pid2 = tbl2.Meta().GetPartitionInfo().Definitions[1].ID
-	tblStats2 = handle.GetPartitionStats(tbl2.Meta(), pid2)
+	tblStats2 = handle.GetPhysicalTableStats(pid2, tbl2.Meta())
 	require.Equal(t, int64(0), tblStats2.ModifyCount)
 	require.Equal(t, int64(8), tblStats2.RealtimeCount)
 }
@@ -330,7 +386,7 @@ func TestAnalyzeHighestPriorityTablesConcurrently(t *testing.T) {
 	require.NoError(t, handle.DumpStatsDeltaToKV(true))
 	require.NoError(t, handle.Update(context.Background(), dom.InfoSchema()))
 	sysProcTracker := dom.SysProcTracker()
-	r := refresher.NewRefresher(handle, sysProcTracker, dom.DDLNotifier())
+	r := refresher.NewRefresher(context.Background(), handle, sysProcTracker, dom.DDLNotifier())
 	defer r.Close()
 	// Analyze tables concurrently.
 	require.NoError(t, util.CallWithSCtx(handle.SPool(), func(sctx sessionctx.Context) error {
@@ -341,25 +397,25 @@ func TestAnalyzeHighestPriorityTablesConcurrently(t *testing.T) {
 	require.NoError(t, handle.DumpStatsDeltaToKV(true))
 	require.NoError(t, handle.Update(context.Background(), dom.InfoSchema()))
 	// Check if t1 and t2 are analyzed (they should be, as they have more new data).
-	tbl1, err := dom.InfoSchema().TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("t1"))
+	tbl1, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t1"))
 	require.NoError(t, err)
 	pid1 := tbl1.Meta().GetPartitionInfo().Definitions[1].ID
-	tblStats1 := handle.GetPartitionStats(tbl1.Meta(), pid1)
+	tblStats1 := handle.GetPhysicalTableStats(pid1, tbl1.Meta())
 	require.Equal(t, int64(0), tblStats1.ModifyCount)
 	require.Equal(t, int64(12), tblStats1.RealtimeCount)
 
-	tbl2, err := dom.InfoSchema().TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("t2"))
+	tbl2, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t2"))
 	require.NoError(t, err)
 	pid2 := tbl2.Meta().GetPartitionInfo().Definitions[1].ID
-	tblStats2 := handle.GetPartitionStats(tbl2.Meta(), pid2)
+	tblStats2 := handle.GetPhysicalTableStats(pid2, tbl2.Meta())
 	require.Equal(t, int64(0), tblStats2.ModifyCount)
 	require.Equal(t, int64(8), tblStats2.RealtimeCount)
 
 	// t3 should not be analyzed yet, as it has the least new data.
-	tbl3, err := dom.InfoSchema().TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("t3"))
+	tbl3, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t3"))
 	require.NoError(t, err)
 	pid3 := tbl3.Meta().GetPartitionInfo().Definitions[1].ID
-	tblStats3 := handle.GetPartitionStats(tbl3.Meta(), pid3)
+	tblStats3 := handle.GetPhysicalTableStats(pid3, tbl3.Meta())
 	require.Equal(t, int64(4), tblStats3.ModifyCount)
 
 	// Do one more round to analyze t3.
@@ -372,9 +428,57 @@ func TestAnalyzeHighestPriorityTablesConcurrently(t *testing.T) {
 	require.NoError(t, handle.Update(context.Background(), dom.InfoSchema()))
 
 	// Now t3 should be analyzed.
-	tblStats3 = handle.GetPartitionStats(tbl3.Meta(), pid3)
+	tblStats3 = handle.GetPhysicalTableStats(pid3, tbl3.Meta())
 	require.Equal(t, int64(0), tblStats3.ModifyCount)
 	require.Equal(t, int64(6), tblStats3.RealtimeCount)
+}
+
+func TestDoNotRetryTableNotExistJob(t *testing.T) {
+	statistics.AutoAnalyzeMinCnt = 0
+	defer func() {
+		statistics.AutoAnalyzeMinCnt = 1000
+	}()
+
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	handle := dom.StatsHandle()
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t1 (a int, b int, index idx(a))")
+	testutil.HandleNextDDLEventWithTxn(handle)
+	// Insert some data.
+	tk.MustExec("insert into t1 values (1, 1)")
+	require.NoError(t, handle.DumpStatsDeltaToKV(true))
+	require.NoError(t, handle.Update(context.Background(), dom.InfoSchema()))
+	sysProcTracker := dom.SysProcTracker()
+	r := refresher.NewRefresher(context.Background(), handle, sysProcTracker, dom.DDLNotifier())
+	defer r.Close()
+
+	require.NoError(t, util.CallWithSCtx(handle.SPool(), func(sctx sessionctx.Context) error {
+		require.True(t, r.AnalyzeHighestPriorityTables(sctx))
+		return nil
+	}))
+	require.Equal(t, 0, r.Len())
+	r.WaitAutoAnalyzeFinishedForTest()
+
+	// Insert more data.
+	tk.MustExec("insert into t1 values (4, 4), (5, 5), (6, 6)")
+	require.NoError(t, handle.DumpStatsDeltaToKV(true))
+	require.NoError(t, handle.Update(context.Background(), dom.InfoSchema()))
+
+	r.ProcessDMLChangesForTest()
+	require.Equal(t, 1, r.Len())
+
+	// Drop the database.
+	tk.MustExec("drop database test")
+
+	require.NoError(t, util.CallWithSCtx(handle.SPool(), func(sctx sessionctx.Context) error {
+		require.False(t, r.AnalyzeHighestPriorityTables(sctx))
+		return nil
+	}))
+	require.Equal(t, 0, r.Len())
+
+	r.ProcessDMLChangesForTest()
+	require.Equal(t, 0, r.Len())
 }
 
 func TestAnalyzeHighestPriorityTablesWithFailedAnalysis(t *testing.T) {
@@ -384,13 +488,15 @@ func TestAnalyzeHighestPriorityTablesWithFailedAnalysis(t *testing.T) {
 	}()
 	store, dom := testkit.CreateMockStoreAndDomain(t)
 	tk := testkit.NewTestKit(t, store)
+	handle := dom.StatsHandle()
 	tk.MustExec("use test")
 	tk.MustExec("set global tidb_enable_auto_analyze=true")
 	tk.MustExec("set global tidb_auto_analyze_concurrency=2")
 	tk.MustExec("create table t1 (a int, b int, index idx(a)) partition by range (a) (partition p0 values less than (2), partition p1 values less than (4))")
+	testutil.HandleNextDDLEventWithTxn(handle)
 	tk.MustExec("create table t2 (a int, b int, index idx(a)) partition by range (a) (partition p0 values less than (2), partition p1 values less than (4))")
+	testutil.HandleNextDDLEventWithTxn(handle)
 	tk.MustExec("analyze table t2")
-	handle := dom.StatsHandle()
 	require.NoError(t, handle.DumpStatsDeltaToKV(true))
 	require.NoError(t, handle.Update(context.Background(), dom.InfoSchema()))
 	tk.MustExec("insert into t1 values (1, 1), (2, 2), (3, 3)")
@@ -401,7 +507,7 @@ func TestAnalyzeHighestPriorityTablesWithFailedAnalysis(t *testing.T) {
 	require.NoError(t, handle.DumpStatsDeltaToKV(true))
 	require.NoError(t, handle.Update(context.Background(), dom.InfoSchema()))
 	sysProcTracker := dom.SysProcTracker()
-	r := refresher.NewRefresher(handle, sysProcTracker, dom.DDLNotifier())
+	r := refresher.NewRefresher(context.Background(), handle, sysProcTracker, dom.DDLNotifier())
 	defer r.Close()
 
 	require.NoError(t, util.CallWithSCtx(handle.SPool(), func(sctx sessionctx.Context) error {
@@ -412,18 +518,18 @@ func TestAnalyzeHighestPriorityTablesWithFailedAnalysis(t *testing.T) {
 
 	is := dom.InfoSchema()
 	// t1 is not analyzed.
-	tbl1, err := is.TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("t1"))
+	tbl1, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t1"))
 	require.NoError(t, err)
 	pid1 := tbl1.Meta().GetPartitionInfo().Definitions[0].ID
-	tblStats1 := handle.GetPartitionStats(tbl1.Meta(), pid1)
+	tblStats1 := handle.GetPhysicalTableStats(pid1, tbl1.Meta())
 	require.False(t, tblStats1.Pseudo)
 	require.Equal(t, int64(1), tblStats1.ModifyCount)
 
 	// t2 is analyzed.
-	tbl2, err := is.TableByName(context.Background(), pmodel.NewCIStr("test"), pmodel.NewCIStr("t2"))
+	tbl2, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t2"))
 	require.NoError(t, err)
 	pid2 := tbl2.Meta().GetPartitionInfo().Definitions[0].ID
-	tblStats2 := handle.GetPartitionStats(tbl2.Meta(), pid2)
+	tblStats2 := handle.GetPhysicalTableStats(pid2, tbl2.Meta())
 	require.False(t, tblStats2.Pseudo)
 	require.Equal(t, int64(0), tblStats2.ModifyCount)
 }

@@ -111,9 +111,9 @@ explain select null as a union all select 'a' as a;
 id	estRows	task	access object	operator info
 Union_8	2.00	root		
 ├─Projection_10	1.00	root		<nil>->Column#3
-│ └─TableDual_11	1.00	root		rows:1
-└─Projection_12	1.00	root		a->Column#3
-  └─TableDual_13	1.00	root		rows:1
+│ └─TableDual_12	1.00	root		rows:1
+└─Projection_14	1.00	root		a->Column#3
+  └─TableDual_16	1.00	root		rows:1
 select null as a union all select 'a' as a;
 a
 NULL
@@ -178,3 +178,18 @@ id	update_user
 2	李四
 4	李四
 1	张三
+drop table if exists test;
+create table test(a bit(24));
+insert into test values('中');
+select a from test where '中' like convert(a, char);
+a
+中
+select a from test where false not like convert(a, char);
+a
+中
+select a from test where false like convert(a, char);
+a
+truncate table test;
+insert into test values(0xffffff);
+select a from test where false not like convert(a, char);
+Error 1105 (HY000): Cannot convert string '\xFF\xFF\xFF' from binary to utf8mb4

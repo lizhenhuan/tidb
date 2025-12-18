@@ -44,7 +44,7 @@ func TestSessionEvalContextBasic(t *testing.T) {
 	require.True(t, impl.GetOptionalPropSet().IsFull())
 
 	// should contain all the optional properties
-	for i := 0; i < exprctx.OptPropsCnt; i++ {
+	for i := range exprctx.OptPropsCnt {
 		provider, ok := impl.GetOptionalPropProvider(exprctx.OptionalEvalPropKey(i))
 		require.True(t, ok)
 		require.NotNil(t, provider)
@@ -54,7 +54,11 @@ func TestSessionEvalContextBasic(t *testing.T) {
 	ctx.ResetSessionAndStmtTimeZone(time.FixedZone("UTC+11", 11*3600))
 	vars.SQLMode = mysql.ModeStrictTransTables | mysql.ModeNoZeroDate
 	sc.SetTypeFlags(types.FlagIgnoreInvalidDateErr | types.FlagSkipUTF8Check)
-	sc.SetErrLevels(errctx.LevelMap{errctx.ErrGroupDupKey: errctx.LevelWarn, errctx.ErrGroupBadNull: errctx.LevelIgnore})
+	sc.SetErrLevels(errctx.LevelMap{
+		errctx.ErrGroupDupKey:    errctx.LevelWarn,
+		errctx.ErrGroupBadNull:   errctx.LevelIgnore,
+		errctx.ErrGroupNoDefault: errctx.LevelIgnore,
+	})
 	vars.CurrentDB = "db1"
 	vars.MaxAllowedPacket = 123456
 

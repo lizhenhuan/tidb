@@ -119,21 +119,21 @@ func TestInstancePlanCacheDMLTPCC(t *testing.T) {
 
 	tk1.MustExec(tpccWarehouse)
 	tk2.MustExec(tpccWarehouse)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		sql := `insert into warehouse values (%d, 'name', 'street1', 'street2', 'city', 'st', 'zip', 0.1, 0.1)`
 		tk1.MustExec(fmt.Sprintf(sql, i))
 		tk2.MustExec(fmt.Sprintf(sql, i))
 	}
 	tk1.MustExec(tpccDistrict)
 	tk2.MustExec(tpccDistrict)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		sql := `insert into district values (%d, %d, 'name', 'street1', 'street2', 'city', 'st', 'zip', 0.1, 0.1, 0)`
 		tk1.MustExec(fmt.Sprintf(sql, i, i))
 		tk2.MustExec(fmt.Sprintf(sql, i, i))
 	}
 	tk1.MustExec(tpccCustomer)
 	tk2.MustExec(tpccCustomer)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		sql := `insert into customer values (%d, %d, %d, 'first', 'm', 'last', 'street1', 'street2',
                              'city', 'st', 'zip', 'phone', '2021-01-01', 'CR',
                              0.1, 0.1, 0.1, 0.1, 1, 1, 'data')`
@@ -216,7 +216,7 @@ func TestInstancePlanCacheDMLTPCC(t *testing.T) {
 		return
 	}
 
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		var prep, set, exec, update string
 		switch rand.Intn(5) {
 		case 0:
@@ -283,7 +283,7 @@ func TestInstancePlanCacheDMLBasic(t *testing.T) {
 			tk.MustQuery("select * from t2").Sort().Rows())
 	}
 
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		prep, set, exec, insert := randInsert()
 		tk.MustExec(prep)
 		tk.MustExec(set)
@@ -292,7 +292,7 @@ func TestInstancePlanCacheDMLBasic(t *testing.T) {
 		checkResult()
 	}
 
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		var prep, set, exec, dml string
 		switch rand.Intn(3) {
 		case 0:
@@ -307,5 +307,141 @@ func TestInstancePlanCacheDMLBasic(t *testing.T) {
 		tk.MustExec(exec)
 		tk.MustExec(dml)
 		checkResult()
+	}
+}
+
+func TestInstancePlanCacheUpdateSpecifiedPartition(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec(`set global tidb_enable_instance_plan_cache=1`)
+	tk.MustExec(`create table t1 (a int, b int) partition by range (a) (
+    		partition p0 values less than (10),
+    		partition p1 values less than (20),
+    		partition p2 values less than (30),
+    		partition p3 values less than (40))`)
+	tk.MustExec(`create table t2 (a int, b int) partition by range (a) (
+    		partition p0 values less than (10),
+    		partition p1 values less than (20),
+    		partition p2 values less than (30),
+    		partition p3 values less than (40))`)
+	for i := range 40 {
+		tk.MustExec(fmt.Sprintf("insert into t1 values (%d, %d)", i, i))
+		tk.MustExec(fmt.Sprintf("insert into t2 values (%d, %d)", i, i))
+	}
+	tk.MustExec(`set @v=1`)
+	for range 100 {
+		pIdx := rand.Intn(5)
+		if pIdx < 4 { // update a specified partition
+			tk.MustExec(fmt.Sprintf(`prepare st from 'update t1 partition(p%v) set b = b + ?'`, pIdx))
+			tk.MustExec(`execute st using @v`)
+			tk.MustExec(`execute st using @v`)
+			tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1")) // can hit the cache
+			tk.MustExec(fmt.Sprintf(`update t2 partition(p%v) set b = b + 2`, pIdx))
+		} else { // no specified partition
+			tk.MustExec(`prepare st from 'update t1 set b = b + ?'`)
+			tk.MustExec(`execute st using @v`)
+			tk.MustExec(`execute st using @v`)
+			tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1")) // can hit the cache
+			tk.MustExec(`update t2 set b = b + 2`)
+		}
+		tk.MustQuery(`select * from t1`).Sort().Check(tk.MustQuery(`select * from t2`).Sort().Rows())
+	}
+}
+
+func TestInstancePlanCacheDMLPartitioning(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec(`set global tidb_enable_instance_plan_cache=1`)
+	tk.MustExec(`create table t1 (a int, b int) partition by range (a) (
+    		partition p0 values less than (10),
+    		partition p1 values less than (20),
+    		partition p2 values less than (30),
+    		partition p3 values less than (40))`)
+	tk.MustExec(`create table t2 (a int, b int) partition by hash(a) partitions 4`)
+	tk.MustExec(`create table t3 (a int, b int) partition by list columns (a) (
+    		partition p0 values in (0, 1, 2),
+    		partition p1 values in (3, 4, 5),
+    		partition p2 values in (6, 7, 8),
+    		partition p3 values in (9, 10, 11))`)
+
+	for _, tbl := range []string{"t1", "t2", "t3"} {
+		// insert
+		tk.MustExec(fmt.Sprintf("prepare st from 'insert into %v values (?, ?)'", tbl))
+		tk.MustExec("set @a = 1, @b = 2")
+		tk.MustExec("execute st using @a, @b")
+		tk.MustExec("execute st using @b, @a")
+		tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+
+		tk.MustExec(fmt.Sprintf("prepare st from 'insert into %v (a, b) values (?, ?)'", tbl))
+		tk.MustExec("set @a = 1, @b = 2")
+		tk.MustExec("execute st using @a, @b")
+		tk.MustExec("execute st using @b, @a")
+		tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+
+		// delete
+		tk.MustExec(fmt.Sprintf("prepare st from 'delete from %v'", tbl))
+		tk.MustExec("execute st")
+		tk.MustExec("execute st")
+		tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+
+		tk.MustExec(fmt.Sprintf("prepare st from 'delete from %v where a = ?'", tbl))
+		tk.MustExec("set @a = 1")
+		tk.MustExec("execute st using @a")
+		tk.MustExec("execute st using @a")
+		tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+
+		tk.MustExec(fmt.Sprintf("prepare st from 'delete from %v where a = ? and b = ?'", tbl))
+		tk.MustExec("set @a = 1, @b = 2")
+		tk.MustExec("execute st using @a, @b")
+		tk.MustExec("execute st using @b, @a")
+		tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+
+		// update
+		tk.MustExec(fmt.Sprintf("prepare st from 'update %v set b = 1'", tbl))
+		tk.MustExec("execute st")
+		tk.MustExec("execute st")
+		tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+
+		tk.MustExec(fmt.Sprintf("prepare st from 'update %v set b = 1 where a = ?'", tbl))
+		tk.MustExec("set @a = 1")
+		tk.MustExec("execute st using @a")
+		tk.MustExec("execute st using @a")
+		tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+
+		tk.MustExec(fmt.Sprintf("prepare st from 'update %v set b = 1 where a = ? and b = ?'", tbl))
+		tk.MustExec("set @a = 1, @b = 2")
+		tk.MustExec("execute st using @a, @b")
+		tk.MustExec("execute st using @b, @a")
+		tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+
+		tk.MustExec(fmt.Sprintf("prepare st from 'update %v partition(p0) set b = 1'", tbl))
+		tk.MustExec("execute st")
+		tk.MustExec("execute st")
+		tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+
+		tk.MustExec(fmt.Sprintf("prepare st from 'update %v partition(p0, p1) set b = 1'", tbl))
+		tk.MustExec("execute st")
+		tk.MustExec("execute st")
+		tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+
+		tk.MustExec(fmt.Sprintf("prepare st from 'update %v partition(p0, p1, p2) set b = 1'", tbl))
+		tk.MustExec("execute st")
+		tk.MustExec("execute st")
+		tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+
+		// replace
+		tk.MustExec(fmt.Sprintf("prepare st from 'replace into %v values (?, ?)'", tbl))
+		tk.MustExec("set @a = 1, @b = 2")
+		tk.MustExec("execute st using @a, @b")
+		tk.MustExec("execute st using @b, @a")
+		tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+
+		tk.MustExec(fmt.Sprintf("prepare st from 'replace into %v (a, b) values (?, ?)'", tbl))
+		tk.MustExec("set @a = 1, @b = 2")
+		tk.MustExec("execute st using @a, @b")
+		tk.MustExec("execute st using @b, @a")
+		tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
 	}
 }

@@ -16,14 +16,17 @@ package scheduler
 
 import (
 	"context"
+	"slices"
 	"sync/atomic"
 	"time"
 
 	"github.com/pingcap/failpoint"
-	"github.com/pingcap/log"
 	"github.com/pingcap/tidb/pkg/disttask/framework/proto"
 	llog "github.com/pingcap/tidb/pkg/lightning/log"
 	"github.com/pingcap/tidb/pkg/util/intest"
+	"github.com/pingcap/tidb/pkg/util/logutil"
+	"github.com/pingcap/tidb/pkg/util/traceevent"
+	"github.com/pingcap/tidb/pkg/util/tracing"
 	"go.uber.org/zap"
 )
 
@@ -44,9 +47,9 @@ type NodeManager struct {
 }
 
 func newNodeManager(serverID string) *NodeManager {
-	logger := log.L()
+	logger := logutil.ErrVerboseLogger()
 	if intest.InTest {
-		logger = log.L().With(zap.String("server-id", serverID))
+		logger = logger.With(zap.String("server-id", serverID))
 	}
 	nm := &NodeManager{
 		logger:        logger,
@@ -120,21 +123,23 @@ func (nm *NodeManager) maintainLiveNodes(ctx context.Context, taskMgr TaskManage
 func (nm *NodeManager) refreshNodesLoop(ctx context.Context, taskMgr TaskManager, slotMgr *SlotManager) {
 	ticker := time.NewTicker(nodesCheckInterval)
 	defer ticker.Stop()
+	trace := traceevent.NewTrace()
+	ctx = tracing.WithFlightRecorder(ctx, trace)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			nm.refreshNodes(ctx, taskMgr, slotMgr)
+			trace.DiscardOrFlush(ctx)
 		}
 	}
 }
 
-// TestRefreshedChan is used to sync the test.
-var TestRefreshedChan = make(chan struct{})
-
 // refreshNodes maintains the nodes managed by the framework.
 func (nm *NodeManager) refreshNodes(ctx context.Context, taskMgr TaskManager, slotMgr *SlotManager) {
+	r := tracing.StartRegion(ctx, "NodeManager.refreshNodes")
+	defer r.End()
 	newNodes, err := taskMgr.GetAllNodes(ctx)
 	if err != nil {
 		nm.logger.Warn("get managed nodes met error", llog.ShortError(err))
@@ -145,23 +150,23 @@ func (nm *NodeManager) refreshNodes(ctx context.Context, taskMgr TaskManager, sl
 	for _, node := range newNodes {
 		if node.CPUCount > 0 {
 			cpuCount = node.CPUCount
+			break
 		}
 	}
 	slotMgr.updateCapacity(cpuCount)
 	nm.nodes.Store(&newNodes)
 
-	failpoint.Inject("syncRefresh", func() {
-		TestRefreshedChan <- struct{}{}
-	})
+	failpoint.InjectCall("syncRefresh")
 }
 
 // GetNodes returns the nodes managed by the framework.
 // return a copy of the nodes.
 func (nm *NodeManager) getNodes() []proto.ManagedNode {
 	nodes := *nm.nodes.Load()
-	res := make([]proto.ManagedNode, len(nodes))
-	copy(res, nodes)
-	return res
+	if nodes == nil {
+		return []proto.ManagedNode{}
+	}
+	return slices.Clone(nodes)
 }
 
 func filterByScope(nodes []proto.ManagedNode, targetScope string) []string {

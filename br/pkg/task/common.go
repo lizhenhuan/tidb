@@ -28,7 +28,7 @@ import (
 	"github.com/pingcap/tidb/br/pkg/metautil"
 	"github.com/pingcap/tidb/br/pkg/storage"
 	"github.com/pingcap/tidb/br/pkg/utils"
-	"github.com/pingcap/tidb/pkg/sessionctx/variable"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	filter "github.com/pingcap/tidb/pkg/util/table-filter"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -252,9 +252,12 @@ type Config struct {
 	// should be removed after TiDB upgrades the BR dependency.
 	Filter filter.MySQLReplicationRules
 
-	FilterStr          []string      `json:"filter-strings" toml:"filter-strings"`
-	TableFilter        filter.Filter `json:"-" toml:"-"`
-	SwitchModeInterval time.Duration `json:"switch-mode-interval" toml:"switch-mode-interval"`
+	FilterStr   []string      `json:"filter-strings" toml:"filter-strings"`
+	TableFilter filter.Filter `json:"-" toml:"-"`
+	// PiTRTableTracker generated from TableFilter during snapshot restore, it has all the db id and table id that needs
+	// to be restored
+	PiTRTableTracker   *utils.PiTRIdTracker `json:"-" toml:"-"`
+	SwitchModeInterval time.Duration        `json:"switch-mode-interval" toml:"switch-mode-interval"`
 	// Schemas is a database name set, to check whether the restore database has been backup
 	Schemas map[string]struct{}
 	// Tables is a table name set, to check whether the restore table has been backup
@@ -294,10 +297,11 @@ func DefineCommonFlags(flags *pflag.FlagSet) {
 	flags.String(flagCA, "", "CA certificate path for TLS connection")
 	flags.String(flagCert, "", "Certificate path for TLS connection")
 	flags.String(flagKey, "", "Private key path for TLS connection")
-	flags.Uint(flagChecksumConcurrency, variable.DefChecksumTableConcurrency, "The concurrency of checksumming in one table")
+	flags.Uint(flagChecksumConcurrency, vardef.DefChecksumTableConcurrency, "The concurrency of checksumming in one table")
 
 	flags.Uint64(flagRateLimit, unlimited, "The rate limit of the task, MB/s per node")
-	flags.Bool(flagChecksum, true, "Run checksum at end of task")
+	// default to false as we think it's unnecessary to run in production as it's resource intensive
+	flags.Bool(flagChecksum, false, "Run checksum at end of task")
 	flags.Bool(flagRemoveTiFlash, true,
 		"Remove TiFlash replicas before backup or restore, for unsupported versions of TiFlash")
 
@@ -401,7 +405,7 @@ func DefineTableFlags(command *cobra.Command) {
 	_ = command.MarkFlagRequired(flagTable)
 }
 
-// DefineFilterFlags defines the --filter and --case-sensitive flags for `full` subcommand.
+// DefineFilterFlags defines the --filter and --case-sensitive flags.
 func DefineFilterFlags(command *cobra.Command, defaultFilter []string, setHidden bool) {
 	flags := command.Flags()
 	flags.StringArrayP(flagFilter, "f", defaultFilter, "select tables to process")
@@ -596,6 +600,10 @@ func (cfg *Config) normalizePDURLs() error {
 	return nil
 }
 
+func (cfg *Config) UserFiltered() bool {
+	return len(cfg.Schemas) != 0 || len(cfg.Tables) != 0 || len(cfg.FilterStr) != 0
+}
+
 // ParseFromFlags parses the config from the flag set.
 func (cfg *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 	var err error
@@ -655,11 +663,14 @@ func (cfg *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 				Schema: db,
 				Name:   tbl,
 			})
+			cfg.FilterStr = []string{fmt.Sprintf("`%s`.`%s`", db, tbl)}
 		} else {
 			cfg.TableFilter = filter.NewSchemasFilter(db)
+			cfg.FilterStr = []string{fmt.Sprintf("`%s`.*", db)}
 		}
 	} else {
 		cfg.TableFilter, _ = filter.Parse([]string{"*.*"})
+		cfg.FilterStr = []string{"*.*"}
 	}
 	if !caseSensitive {
 		cfg.TableFilter = filter.CaseInsensitive(cfg.TableFilter)
@@ -777,6 +788,11 @@ func (cfg *Config) parseAndValidateMasterKeyInfo(hasPlaintextKey bool, flags *pf
 	return nil
 }
 
+// OverrideDefaultForBackup override common config for backup tasks
+func (cfg *Config) OverrideDefaultForBackup() {
+	cfg.Checksum = false
+}
+
 // NewMgr creates a new mgr at the given PD address.
 func NewMgr(ctx context.Context,
 	g glue.Glue, pds []string,
@@ -890,7 +906,8 @@ func ReadBackupMeta(
 // flagToZapField checks whether this flag can be logged,
 // if need to log, return its zap field. Or return a field with hidden value.
 func flagToZapField(f *pflag.Flag) zap.Field {
-	if f.Name == flagStorage {
+	switch f.Name {
+	case flagStorage, FlagStreamFullBackupStorage:
 		hiddenQuery, err := url.Parse(f.Value.String())
 		if err != nil {
 			return zap.String(f.Name, "<invalid URI>")
@@ -898,8 +915,14 @@ func flagToZapField(f *pflag.Flag) zap.Field {
 		// hide all query here.
 		hiddenQuery.RawQuery = ""
 		return zap.Stringer(f.Name, hiddenQuery)
+	case flagFullBackupCipherKey, flagLogBackupCipherKey, "azblob.encryption-key":
+		return zap.String(f.Name, "<redacted>")
+	case flagMasterKeyConfig:
+		// TODO: we don't really need to hide the entirety of --master-key, consider parsing the URL here.
+		return zap.String(f.Name, "<redacted>")
+	default:
+		return zap.Stringer(f.Name, f.Value)
 	}
-	return zap.Stringer(f.Name, f.Value)
 }
 
 // LogArguments prints origin command arguments.
@@ -931,7 +954,7 @@ func (cfg *Config) adjust() {
 		cfg.GRPCKeepaliveTimeout = defaultGRPCKeepaliveTimeout
 	}
 	if cfg.ChecksumConcurrency == 0 {
-		cfg.ChecksumConcurrency = variable.DefChecksumTableConcurrency
+		cfg.ChecksumConcurrency = vardef.DefChecksumTableConcurrency
 	}
 	if cfg.MetadataDownloadBatchSize == 0 {
 		cfg.MetadataDownloadBatchSize = defaultMetadataDownloadBatchSize
@@ -982,9 +1005,15 @@ func progressFileWriterRoutine(ctx context.Context, progress glue.Progress, tota
 		cur := progress.GetCurrent()
 		p := float64(cur) / float64(total)
 		p *= 100
-		err := os.WriteFile(progressFile, []byte(fmt.Sprintf("%.2f", p)), 0600)
+		err := os.WriteFile(progressFile, fmt.Appendf(nil, "%.2f", p), 0600)
 		if err != nil {
 			log.Warn("failed to update tmp progress file", zap.Error(err))
 		}
 	}
+}
+
+func WriteStringToConsole(g glue.Glue, msg string) error {
+	b := []byte(msg)
+	_, err := glue.GetConsole(g).Out().Write(b)
+	return err
 }

@@ -67,11 +67,11 @@ PARTITION BY RANGE (c) (
 );
 insert into test_t1 values (1,1,1);
 
-explain format='brief' select * from test_t1 where a = 1;
+explain format='plan_tree' select * from test_t1 where a = 1;
 select * from test_t1 where a = 1;
 
 analyze table test_t1;
-explain format='brief' select * from test_t1 where a = 1;
+explain format='plan_tree' select * from test_t1 where a = 1;
 select * from test_t1 where a = 1;
 
 
@@ -98,7 +98,7 @@ select * from t where a = 'bbc';
 select a from t partition (p0) order by a;
 select a from t partition (p1) order by a;
 --replace_regex /in\(_tidb_tid, [0-9]+\)/in(_tidb_tid, tid1)/
-explain format = 'brief' select a from t partition (p1) order by a;
+explain format = 'plan_tree' select a from t partition (p1) order by a;
 
 drop table if exists t;
 ## Test for stored generated column with global index
@@ -121,7 +121,7 @@ select * from t where a = 'bbc';
 select a from t partition (p0) order by a;
 select a from t partition (p1) order by a;
 --replace_regex /in\(_tidb_tid, [0-9]+\)/in(_tidb_tid, tid1)/
-explain format = 'brief' select a from t partition (p1) order by a;
+explain format = 'plan_tree' select a from t partition (p1) order by a;
 
 ## Test syntax
 drop table if exists t;
@@ -139,13 +139,13 @@ CREATE TABLE `t` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
 PARTITION BY HASH (`a`) PARTITIONS 3;
 show create table t;
---error 8200
 alter table t partition by key (b) partitions 3;
+alter table t partition by key (b) partitions 3 update indexes (idx_b GLOBAL);
+alter table t partition by key (b) partitions 3 update indexes (idx_b LOCAL);
 --error 8264
 alter table t partition by hash (a) partitions 3 update indexes (idx_b LOCAL);
 alter table t partition by hash (a) partitions 3 update indexes (idx_b GLOBAL);
 show create table t;
---error 8200
 alter table t partition by hash (b) partitions 3 update indexes(idx_b global);
 alter table t partition by hash (b) partitions 3 update indexes(idx_b local);
 show create table t;

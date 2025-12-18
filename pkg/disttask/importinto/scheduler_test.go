@@ -20,9 +20,11 @@ import (
 	"testing"
 
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/pkg/config/kerneltype"
 	"github.com/pingcap/tidb/pkg/disttask/framework/proto"
 	"github.com/pingcap/tidb/pkg/disttask/framework/scheduler"
 	"github.com/pingcap/tidb/pkg/executor/importer"
+	drivererr "github.com/pingcap/tidb/pkg/store/driver/error"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
@@ -43,7 +45,7 @@ func (s *importIntoSuite) enableFailPoint(path, term string) {
 }
 
 func (s *importIntoSuite) TestSchedulerGetEligibleInstances() {
-	sch := ImportSchedulerExt{}
+	sch := importScheduler{}
 	task := &proto.Task{Meta: []byte("{}")}
 	ctx := context.WithValue(context.Background(), "etcd", true)
 	eligibleInstances, err := sch.GetEligibleInstances(ctx, task)
@@ -66,7 +68,7 @@ func (s *importIntoSuite) TestUpdateCurrentTask() {
 	bs, err := json.Marshal(taskMeta)
 	require.NoError(s.T(), err)
 
-	sch := ImportSchedulerExt{}
+	sch := importScheduler{}
 	require.Equal(s.T(), int64(0), sch.currTaskID.Load())
 	require.False(s.T(), sch.disableTiKVImportMode.Load())
 
@@ -97,9 +99,10 @@ func (s *importIntoSuite) TestSchedulerInit() {
 		BaseScheduler: scheduler.NewBaseScheduler(context.Background(), &proto.Task{
 			Meta: bytes,
 		}, scheduler.Param{}),
+		store: &StoreWithoutKS{},
 	}
 	s.NoError(sch.Init())
-	s.False(sch.Extension.(*ImportSchedulerExt).GlobalSort)
+	s.False(sch.Extension.(*importScheduler).GlobalSort)
 
 	meta.Plan.CloudStorageURI = "s3://test"
 	bytes, err = json.Marshal(meta)
@@ -108,23 +111,32 @@ func (s *importIntoSuite) TestSchedulerInit() {
 		BaseScheduler: scheduler.NewBaseScheduler(context.Background(), &proto.Task{
 			Meta: bytes,
 		}, scheduler.Param{}),
+		store: &StoreWithoutKS{},
 	}
 	s.NoError(sch.Init())
-	s.True(sch.Extension.(*ImportSchedulerExt).GlobalSort)
+	s.True(sch.Extension.(*importScheduler).GlobalSort)
 }
 
 func (s *importIntoSuite) TestGetNextStep() {
 	task := &proto.TaskBase{Step: proto.StepInit}
-	ext := &ImportSchedulerExt{}
+	ext := &importScheduler{}
 	for _, nextStep := range []proto.Step{proto.ImportStepImport, proto.ImportStepPostProcess, proto.StepDone} {
 		s.Equal(nextStep, ext.GetNextStep(task))
 		task.Step = nextStep
 	}
 
 	task.Step = proto.StepInit
-	ext = &ImportSchedulerExt{GlobalSort: true}
-	for _, nextStep := range []proto.Step{proto.ImportStepEncodeAndSort, proto.ImportStepMergeSort,
-		proto.ImportStepWriteAndIngest, proto.ImportStepPostProcess, proto.StepDone} {
+	ext = &importScheduler{GlobalSort: true}
+	var targetSteps []proto.Step
+	if kerneltype.IsClassic() {
+		targetSteps = []proto.Step{proto.ImportStepEncodeAndSort, proto.ImportStepMergeSort,
+			proto.ImportStepWriteAndIngest, proto.ImportStepCollectConflicts, proto.ImportStepConflictResolution,
+			proto.ImportStepPostProcess, proto.StepDone}
+	} else {
+		targetSteps = []proto.Step{proto.ImportStepEncodeAndSort, proto.ImportStepMergeSort,
+			proto.ImportStepWriteAndIngest, proto.ImportStepPostProcess, proto.StepDone}
+	}
+	for _, nextStep := range targetSteps {
 		s.Equal(nextStep, ext.GetNextStep(task))
 		task.Step = nextStep
 	}
@@ -135,8 +147,13 @@ func (s *importIntoSuite) TestGetStepOfEncode() {
 	s.Equal(proto.ImportStepEncodeAndSort, getStepOfEncode(true))
 }
 
+func (s *importIntoSuite) TestIsRetryable() {
+	ext := &importScheduler{}
+	require.True(s.T(), ext.IsRetryableErr(drivererr.ErrRegionUnavailable))
+}
+
 func TestIsImporting2TiKV(t *testing.T) {
-	ext := &ImportSchedulerExt{}
+	ext := &importScheduler{}
 	require.False(t, ext.isImporting2TiKV(&proto.Task{TaskBase: proto.TaskBase{Step: proto.ImportStepEncodeAndSort}}))
 	require.False(t, ext.isImporting2TiKV(&proto.Task{TaskBase: proto.TaskBase{Step: proto.ImportStepMergeSort}}))
 	require.False(t, ext.isImporting2TiKV(&proto.Task{TaskBase: proto.TaskBase{Step: proto.ImportStepPostProcess}}))

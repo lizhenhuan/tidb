@@ -35,66 +35,60 @@ import (
 	"github.com/pingcap/tidb/pkg/testkit/external"
 	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
 	"github.com/pingcap/tidb/pkg/types"
-	"github.com/pingcap/tidb/pkg/util/mock"
 	"github.com/stretchr/testify/require"
 )
 
 func TestColumnAdd(t *testing.T) {
-	store, dom := testkit.CreateMockStoreAndDomain(t)
+	store := testkit.CreateMockStore(t)
 	ddl.SetWaitTimeWhenErrorOccurred(1 * time.Microsecond)
 	tk := testkit.NewTestKit(t, store)
-	internal := testkit.NewTestKit(t, store)
+	se := tk.Session()
 	tk.MustExec("use test")
 	tk.MustExec("create table t (c1 int, c2 int);")
 	tk.MustExec("insert t values (1, 2);")
 
-	ct := testNewContext(store)
-	// set up hook
 	var (
 		deleteOnlyTable table.Table
 		writeOnlyTable  table.Table
 		publicTable     table.Table
 		dropCol         *table.Column
+		jobID           atomic.Int64
 	)
-	first := true
-	var jobID int64
-	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/onJobUpdated", func(job *model.Job) {
-		jobID = job.ID
-		tbl, exist := dom.InfoSchema().TableByID(context.Background(), job.TableID)
-		require.True(t, exist)
+
+	// Add column with default value.
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/afterWaitSchemaSynced", func(job *model.Job) {
+		if job.State == model.JobStateSynced {
+			return
+		}
+		jobID.Store(job.ID)
+		tbl := external.GetTableByName(t, tk, "test", "t")
 		switch job.SchemaState {
 		case model.StateDeleteOnly:
 			deleteOnlyTable = tbl
 		case model.StateWriteOnly:
 			writeOnlyTable = tbl
-			require.NoError(t, checkAddWriteOnly(ct, deleteOnlyTable, writeOnlyTable, kv.IntHandle(1)))
+			require.NoError(t, checkAddWriteOnly(se, deleteOnlyTable, writeOnlyTable, kv.IntHandle(1)))
 		case model.StatePublic:
-			if !first {
-				return
-			}
-			first = false
 			publicTable = tbl
-			require.NoError(t, checkAddPublic(ct, writeOnlyTable, publicTable))
+			require.NoError(t, checkAddPublic(se, writeOnlyTable, publicTable))
 		}
 	})
 	tk.MustExec("alter table t add column c3 int default 3")
-	tb := publicTable
-	v := getSchemaVer(t, tk.Session())
-	checkHistoryJobArgs(t, tk.Session(), jobID, &historyJobArgs{ver: v, tbl: tb.Meta()})
+	checkJobWithHistory(t, se, jobID.Load(), nil, publicTable.Meta())
 
 	// Drop column.
-	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/onJobRunBefore", func(job *model.Job) {
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/beforeRunOneJobStep", func(job *model.Job) {
 		if dropCol == nil {
-			tbl := external.GetTableByName(t, internal, "test", "t")
+			tbl := external.GetTableByName(t, tk, "test", "t")
 			dropCol = tbl.VisibleCols()[2]
 		}
 	})
-	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/onJobUpdated", func(job *model.Job) {
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/afterWaitSchemaSynced", func(job *model.Job) {
 		if job.NotStarted() {
 			return
 		}
-		jobID = job.ID
-		tbl := external.GetTableByName(t, internal, "test", "t")
+		jobID.Store(job.ID)
+		tbl := external.GetTableByName(t, tk, "test", "t")
 		if job.SchemaState != model.StatePublic {
 			for _, col := range tbl.Cols() {
 				require.NotEqualf(t, col.ID, dropCol.ID, "column is not dropped")
@@ -102,33 +96,28 @@ func TestColumnAdd(t *testing.T) {
 		}
 	})
 	tk.MustExec("alter table t drop column c3")
-	v = getSchemaVer(t, tk.Session())
-	// Don't check column, so it's ok to use tb.
-	checkHistoryJobArgs(t, tk.Session(), jobID, &historyJobArgs{ver: v, tbl: tb.Meta()})
+	// checkJobWithHistory doesn't check column, so it's ok to use previous one.
+	checkJobWithHistory(t, se, jobID.Load(), nil, publicTable.Meta())
 
-	// Add column not default.
-	first = true
-	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/onJobUpdated", func(job *model.Job) {
-		jobID = job.ID
-		tbl, exist := dom.InfoSchema().TableByID(context.Background(), job.TableID)
-		require.True(t, exist)
+	// Add column with no default value set.
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/afterWaitSchemaSynced", func(job *model.Job) {
+		if job.State == model.JobStateSynced {
+			return
+		}
+		jobID.Store(job.ID)
+		tbl := external.GetTableByName(t, tk, "test", "t")
 		switch job.SchemaState {
 		case model.StateWriteOnly:
 			writeOnlyTable = tbl
 		case model.StatePublic:
-			if !first {
-				return
-			}
-			first = false
-			sess := testNewContext(store)
-			txn, err := newTxn(sess)
+			txn, err := newTxn(se)
 			require.NoError(t, err)
-			_, err = writeOnlyTable.AddRecord(sess.GetTableCtx(), txn, types.MakeDatums(10, 10))
+			_, err = writeOnlyTable.AddRecord(se.GetTableCtx(), txn, types.MakeDatums(10, 10))
 			require.NoError(t, err)
 		}
 	})
 	tk.MustExec("alter table t add column c3 int")
-	testCheckJobDone(t, store, jobID, true)
+	testCheckJobDone(t, store, jobID.Load(), true)
 }
 
 func TestModifyAutoRandColumnWithMetaKeyChanged(t *testing.T) {
@@ -143,7 +132,7 @@ func TestModifyAutoRandColumnWithMetaKeyChanged(t *testing.T) {
 	var dbID int64
 	var tID int64
 	var jobID int64
-	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/onJobRunBefore", func(job *model.Job) {
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/beforeRunOneJobStep", func(job *model.Job) {
 		jobID = job.ID
 		dbID = job.SchemaID
 		tID = job.TableID
@@ -210,6 +199,10 @@ func checkAddWriteOnly(ctx sessionctx.Context, deleteOnlyTable, writeOnlyTable t
 	if err != nil {
 		return errors.Trace(err)
 	}
+	err = txn.Commit(context.Background())
+	if err != nil {
+		return errors.Trace(err)
+	}
 	txn, err = newTxn(ctx)
 	if err != nil {
 		return errors.Trace(err)
@@ -248,6 +241,10 @@ func checkAddWriteOnly(ctx sessionctx.Context, deleteOnlyTable, writeOnlyTable t
 	if err != nil {
 		return errors.Trace(err)
 	}
+	err = txn.Commit(context.Background())
+	if err != nil {
+		return errors.Trace(err)
+	}
 	txn, err = newTxn(ctx)
 	if err != nil {
 		return errors.Trace(err)
@@ -262,6 +259,10 @@ func checkAddWriteOnly(ctx sessionctx.Context, deleteOnlyTable, writeOnlyTable t
 	}
 	// DeleteOnlyTable: delete from t where c2 = 2
 	err = deleteOnlyTable.RemoveRecord(ctx.GetTableCtx(), txn, h, types.MakeDatums(2, 2))
+	if err != nil {
+		return errors.Trace(err)
+	}
+	err = txn.Commit(context.Background())
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -294,6 +295,10 @@ func checkAddPublic(sctx sessionctx.Context, writeOnlyTable, publicTable table.T
 	if err != nil {
 		return errors.Trace(err)
 	}
+	err = txn.Commit(context.Background())
+	if err != nil {
+		return errors.Trace(err)
+	}
 	txn, err = newTxn(sctx)
 	if err != nil {
 		return errors.Trace(err)
@@ -308,6 +313,10 @@ func checkAddPublic(sctx sessionctx.Context, writeOnlyTable, publicTable table.T
 	}
 	newRow := types.MakeDatums(3, 4, oldRow[2].GetValue())
 	err = writeOnlyTable.UpdateRecord(sctx.GetTableCtx(), txn, h, oldRow, newRow, touchedSlice(writeOnlyTable))
+	if err != nil {
+		return errors.Trace(err)
+	}
+	err = txn.Commit(context.Background())
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -351,13 +360,6 @@ func datumsToInterfaces(datums []types.Datum) []any {
 	return ifs
 }
 
-type historyJobArgs struct {
-	ver    int64
-	db     *model.DBInfo
-	tbl    *model.TableInfo
-	tblIDs map[int64]struct{}
-}
-
 func getSchemaVer(t *testing.T, ctx sessionctx.Context) int64 {
 	txn, err := newTxn(ctx)
 	require.NoError(t, err)
@@ -377,23 +379,21 @@ func checkEqualTable(t *testing.T, t1, t2 *model.TableInfo) {
 	require.Equal(t, t1.AutoIncID, t2.AutoIncID)
 }
 
-func checkHistoryJobArgs(t *testing.T, ctx sessionctx.Context, id int64, args *historyJobArgs) {
+// checkJobWithHistory checks the history job info with the expected one.
+func checkJobWithHistory(t *testing.T, ctx sessionctx.Context, id int64, dbInfo *model.DBInfo, tblInfo *model.TableInfo) {
+	ver := getSchemaVer(t, ctx)
+
 	historyJob, err := ddl.GetHistoryJobByID(ctx, id)
 	require.NoError(t, err)
 	require.Greater(t, historyJob.BinlogInfo.FinishedTS, uint64(0))
+	require.Equal(t, historyJob.BinlogInfo.SchemaVersion, ver)
 
-	if args.tbl != nil {
-		require.Equal(t, historyJob.BinlogInfo.SchemaVersion, args.ver)
-		checkEqualTable(t, historyJob.BinlogInfo.TableInfo, args.tbl)
-		return
+	if tblInfo != nil {
+		checkEqualTable(t, historyJob.BinlogInfo.TableInfo, tblInfo)
 	}
 
-	// for handling schema job
-	require.Equal(t, historyJob.BinlogInfo.SchemaVersion, args.ver)
-	require.Equal(t, historyJob.BinlogInfo.DBInfo, args.db)
-	// only for creating schema job
-	if args.db != nil && len(args.tblIDs) == 0 {
-		return
+	if dbInfo != nil {
+		require.Equal(t, historyJob.BinlogInfo.DBInfo, dbInfo)
 	}
 }
 
@@ -415,12 +415,6 @@ func testCheckJobDone(t *testing.T, store kv.Storage, jobID int64, isAdd bool) {
 	}
 }
 
-func testNewContext(store kv.Storage) sessionctx.Context {
-	ctx := mock.NewContext()
-	ctx.Store = store
-	return ctx
-}
-
 func TestIssue40135(t *testing.T) {
 	store := testkit.CreateMockStore(t)
 	tk := testkit.NewTestKit(t, store)
@@ -432,7 +426,7 @@ func TestIssue40135(t *testing.T) {
 	tk.MustExec("CREATE TABLE t40135 ( a tinyint DEFAULT NULL, b varchar(32) DEFAULT 'md') PARTITION BY HASH (a) PARTITIONS 2")
 	one := true
 	var checkErr error
-	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/onJobRunBefore", func(job *model.Job) {
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/beforeRunOneJobStep", func(job *model.Job) {
 		if one {
 			one = false
 			_, checkErr = tk1.Exec("alter table t40135 change column a aNew SMALLINT NULL DEFAULT '-14996'")

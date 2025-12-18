@@ -24,7 +24,7 @@ import (
 	"github.com/pingcap/tidb/pkg/ddl/util"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta/model"
-	sessiontypes "github.com/pingcap/tidb/pkg/session/types"
+	"github.com/pingcap/tidb/pkg/session/sessionapi"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/pingcap/tidb/pkg/testkit/external"
 	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
@@ -37,8 +37,6 @@ func TestGetDDLInfo(t *testing.T) {
 	tk := testkit.NewTestKit(t, store)
 	sess := tk.Session()
 	tk.MustExec("begin")
-	txn, err := sess.Txn(true)
-	require.NoError(t, err)
 
 	dbInfo2 := &model.DBInfo{
 		ID: 2,
@@ -58,7 +56,7 @@ func TestGetDDLInfo(t *testing.T) {
 		RowCount: 0,
 	}
 
-	err = addDDLJobs(sess, txn, job)
+	err := addDDLJobs(sess, job)
 	require.NoError(t, err)
 
 	info, err := ddl.GetDDLInfo(sess)
@@ -68,7 +66,7 @@ func TestGetDDLInfo(t *testing.T) {
 	require.Nil(t, info.ReorgHandle)
 
 	// two jobs
-	err = addDDLJobs(sess, txn, job1)
+	err = addDDLJobs(sess, job1)
 	require.NoError(t, err)
 
 	info, err = ddl.GetDDLInfo(sess)
@@ -81,7 +79,7 @@ func TestGetDDLInfo(t *testing.T) {
 	tk.MustExec("rollback")
 }
 
-func addDDLJobs(sess sessiontypes.Session, txn kv.Transaction, job *model.Job) error {
+func addDDLJobs(sess sessionapi.Session, job *model.Job) error {
 	b, err := job.Encode(true)
 	if err != nil {
 		return err
@@ -106,7 +104,7 @@ func TestIssue42268(t *testing.T) {
 	tk1 := testkit.NewTestKit(t, store)
 	tk1.MustExec("use test")
 
-	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/onJobRunBefore", func(job *model.Job) {
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/beforeRunOneJobStep", func(job *model.Job) {
 		if tbl.Meta().ID != job.TableID {
 			return
 		}

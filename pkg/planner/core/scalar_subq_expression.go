@@ -190,11 +190,6 @@ func (s *ScalarSubQueryExpr) Decorrelate(*expression.Schema) expression.Expressi
 	return s
 }
 
-// resolveIndices implements the Expression interface.
-func (*ScalarSubQueryExpr) resolveIndices(*expression.Schema) error {
-	return nil
-}
-
 // ResolveIndices implements the Expression interface.
 func (s *ScalarSubQueryExpr) ResolveIndices(_ *expression.Schema) (expression.Expression, error) {
 	return s, nil
@@ -203,11 +198,6 @@ func (s *ScalarSubQueryExpr) ResolveIndices(_ *expression.Schema) (expression.Ex
 // ResolveIndicesByVirtualExpr implements the Expression interface.
 func (s *ScalarSubQueryExpr) ResolveIndicesByVirtualExpr(_ expression.EvalContext, _ *expression.Schema) (expression.Expression, bool) {
 	return s, false
-}
-
-// resolveIndicesByVirtualExpr implements the Expression interface.
-func (*ScalarSubQueryExpr) resolveIndicesByVirtualExpr(_ expression.EvalContext, _ *expression.Schema) bool {
-	return false
 }
 
 // RemapColumn implements the Expression interface.
@@ -233,16 +223,14 @@ func (s *ScalarSubQueryExpr) Hash64(h base2.Hasher) {
 
 // Equals implements the HashEquals.<1st> interface.
 func (s *ScalarSubQueryExpr) Equals(other any) bool {
-	if other == nil {
+	s2, ok := other.(*ScalarSubQueryExpr)
+	if !ok {
 		return false
 	}
-	var s2 *ScalarSubQueryExpr
-	switch x := other.(type) {
-	case *ScalarSubQueryExpr:
-		s2 = x
-	case ScalarSubQueryExpr:
-		s2 = &x
-	default:
+	if s == nil {
+		return s2 == nil
+	}
+	if s2 == nil {
 		return false
 	}
 	return s.scalarSubqueryColID == s2.scalarSubqueryColID
@@ -332,7 +320,7 @@ func (ssctx *ScalarSubqueryEvalCtx) ExplainInfo() string {
 	for i, id := range ssctx.outputColIDs {
 		fmt.Fprintf(builder, "ScalarQueryCol#%d", id)
 		if i+1 != len(ssctx.outputColIDs) {
-			fmt.Fprintf(builder, ",")
+			fmt.Fprintf(builder, ", ")
 		}
 	}
 	return builder.String()

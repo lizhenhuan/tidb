@@ -226,7 +226,7 @@ func (dr *delRange) doTask(sctx sessionctx.Context, r util.DelRangeTask) error {
 			defer iter.Close()
 
 			txn.SetDiskFullOpt(kvrpcpb.DiskFullOpt_AllowedOnAlmostFull)
-			for i := 0; i < delBatchSize; i++ {
+			for range delBatchSize {
 				if !iter.Valid() {
 					break
 				}
@@ -288,10 +288,7 @@ func insertJobIntoDeleteRangeTable(ctx context.Context, wrapper DelRangeExecWrap
 		}
 		tableIDs := args.AllDroppedTableIDs
 		for i := 0; i < len(tableIDs); i += batchInsertDeleteRangeSize {
-			batchEnd := len(tableIDs)
-			if batchEnd > i+batchInsertDeleteRangeSize {
-				batchEnd = i + batchInsertDeleteRangeSize
-			}
+			batchEnd := min(len(tableIDs), i+batchInsertDeleteRangeSize)
 			if err := doBatchDeleteTablesRange(ctx, wrapper, job.ID, tableIDs[i:batchEnd], ea, "drop schema: table IDs"); err != nil {
 				return errors.Trace(err)
 			}
@@ -327,13 +324,24 @@ func insertJobIntoDeleteRangeTable(ctx context.Context, wrapper DelRangeExecWrap
 		// always delete the table range, even when it's a partitioned table where
 		// it may contain global index regions.
 		return errors.Trace(doBatchDeleteTablesRange(ctx, wrapper, job.ID, []int64{tableID}, ea, "truncate table: table ID"))
-	case model.ActionDropTablePartition, model.ActionReorganizePartition,
-		model.ActionRemovePartitioning, model.ActionAlterTablePartitioning:
+	case model.ActionDropTablePartition:
 		args, err := model.GetFinishedTablePartitionArgs(job)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		return errors.Trace(doBatchDeleteTablesRange(ctx, wrapper, job.ID, args.OldPhysicalTblIDs, ea, "reorganize/drop partition: physical table ID(s)"))
+		return errors.Trace(doBatchDeleteTablesRange(ctx, wrapper, job.ID, args.OldPhysicalTblIDs, ea, "drop partition: physical table ID(s)"))
+	case model.ActionReorganizePartition, model.ActionRemovePartitioning, model.ActionAlterTablePartitioning:
+		// Delete dropped partitions, as well as replaced global indexes.
+		args, err := model.GetFinishedTablePartitionArgs(job)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		for _, idx := range args.OldGlobalIndexes {
+			if err := doBatchDeleteIndiceRange(ctx, wrapper, job.ID, idx.TableID, []int64{idx.IndexID}, ea, "reorganize partition, replaced global indexes"); err != nil {
+				return errors.Trace(err)
+			}
+		}
+		return errors.Trace(doBatchDeleteTablesRange(ctx, wrapper, job.ID, args.OldPhysicalTblIDs, ea, "reorganize partition: physical table ID(s)"))
 	case model.ActionTruncateTablePartition:
 		args, err := model.GetTruncateTableArgs(job)
 		if err != nil {
@@ -541,11 +549,7 @@ func (sdr *sessionDelRangeExecWrapper) AppendParamsList(jobID, elemID int64, sta
 }
 
 func (sdr *sessionDelRangeExecWrapper) ConsumeDeleteRange(ctx context.Context, sql string) error {
-	// set session disk full opt
-	sdr.sctx.GetSessionVars().SetDiskFullOpt(kvrpcpb.DiskFullOpt_AllowedOnAlmostFull)
 	_, err := sdr.sctx.GetSQLExecutor().ExecuteInternal(ctx, sql, sdr.paramsList...)
-	// clear session disk full opt
-	sdr.sctx.GetSessionVars().ClearDiskFullOpt()
 	sdr.paramsList = nil
 	return errors.Trace(err)
 }

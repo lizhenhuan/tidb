@@ -35,6 +35,11 @@ func newOperatorCommand() *cobra.Command {
 	cmd.AddCommand(newBase64ifyCommand())
 	cmd.AddCommand(newListMigrationsCommand())
 	cmd.AddCommand(newMigrateToCommand())
+	cmd.AddCommand(newForceFlushCommand())
+	cmd.AddCommand(newChecksumCommand())
+	cmd.AddCommand(newTestStorageCommand())
+	cmd.AddCommand(newPitrChecksumCommand())
+	cmd.AddCommand(newUpstreamChecksumCommand())
 	return cmd
 }
 
@@ -94,9 +99,10 @@ func newListMigrationsCommand() *cobra.Command {
 
 func newMigrateToCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "migrate-to",
-		Short: "migrate to a specific version",
-		Args:  cobra.NoArgs,
+		Use: "unsafe-migrate-to",
+		Short: "migrate to a specific version, use truncate will auto migrate to correct version, " +
+			"you should never use this command unless you know what you are doing",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := operator.MigrateToConfig{}
 			if err := cfg.ParseFromFlags(cmd.Flags()); err != nil {
@@ -107,5 +113,110 @@ func newMigrateToCommand() *cobra.Command {
 		},
 	}
 	operator.DefineFlagsForMigrateToConfig(cmd.Flags())
+	cmd.Hidden = true
+	return cmd
+}
+
+func newChecksumCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "checksum-as",
+		Short: "calculate the checksum with rewrite rules",
+		Long: "Calculate the checksum of the current cluster (specified by `-u`) " +
+			"with applying the rewrite rules generated from a backup (specified by `-s`). " +
+			"This can be used when you have the checksum of upstream elsewhere.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg := operator.ChecksumWithRewriteRulesConfig{}
+			if err := cfg.ParseFromFlags(cmd.Flags()); err != nil {
+				return err
+			}
+			ctx := GetDefaultContext()
+			return operator.RunChecksumTable(ctx, tidbGlue, cfg)
+		},
+	}
+	task.DefineFilterFlags(cmd, []string{"!*.*"}, false)
+	operator.DefineFlagsForChecksumTableConfig(cmd.Flags())
+	return cmd
+}
+
+func newPitrChecksumCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "checksum-pitr",
+		Short: "calculate the checksum with pitr id map",
+		Long: "Calculate the checksum of the current cluster (specified by `-u`) " +
+			"with applying the rewrite rules generated from pitr id map (specified by `-s` if saved in external storage). " +
+			"This can be used when you have the checksum of upstream elsewhere.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg := operator.ChecksumWithPitrIdMapConfig{}
+			if err := cfg.ParseFromFlags(cmd.Flags()); err != nil {
+				return err
+			}
+			ctx := GetDefaultContext()
+			return operator.RunPitrChecksumTable(ctx, tidbGlue, cfg)
+		},
+	}
+	task.DefineFilterFlags(cmd, []string{"!*.*"}, false)
+	operator.DefineFlagsForChecksumPitrTableConfig(cmd.Flags())
+	return cmd
+}
+
+func newUpstreamChecksumCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "checksum-upstream",
+		Short: "calculate the checksum",
+		Long: "Calculate the checksum of the current cluster (specified by `-u`). " +
+			"This can be used when you have the checksum of upstream elsewhere",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg := operator.ChecksumUpstreamConfig{}
+			if err := cfg.ParseFromFlags(cmd.Flags()); err != nil {
+				return err
+			}
+			ctx := GetDefaultContext()
+			return operator.RunUpstreamChecksumTable(ctx, tidbGlue, cfg)
+		},
+	}
+	task.DefineFilterFlags(cmd, []string{"!*.*"}, false)
+	operator.DefineFlagsForChecksumUpstreamTableConfig(cmd.Flags())
+	return cmd
+}
+
+func newForceFlushCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "force-flush",
+		Short: "force a log backup task to flush",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg := operator.ForceFlushConfig{}
+			if err := cfg.ParseFromFlags(cmd.Flags()); err != nil {
+				return err
+			}
+			ctx := GetDefaultContext()
+			return operator.RunForceFlush(ctx, &cfg)
+		},
+	}
+	operator.DefineFlagsForForceFlushConfig(cmd.Flags())
+	return cmd
+}
+
+func newTestStorageCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "test-storage",
+		Short: "test all operations of an external storage",
+		Long: "Test all ExternalStorage operations including read, write, delete, " +
+			"rename, walk, and streaming operations. This helps verify storage " +
+			"configuration and permissions before using it for backup/restore.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg := operator.TestStorageConfig{}
+			if err := cfg.ParseFromFlags(cmd.Flags()); err != nil {
+				return err
+			}
+			ctx := GetDefaultContext()
+			return operator.RunTestStorage(ctx, cfg)
+		},
+	}
+	operator.DefineFlagsForTestStorageConfig(cmd.Flags())
 	return cmd
 }
